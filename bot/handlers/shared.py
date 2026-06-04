@@ -18,13 +18,11 @@ def invite_link(token: str) -> str:
     return f"https://t.me/{config.bot_username}?start=join_{token}"
 
 
-# ---------- вступление по ссылке: /start join_<token> ----------
 @router.message(CommandStart(deep_link=True))
 async def start_deeplink(message: Message, command: CommandObject,
                          state: FSMContext, bot: Bot):
     arg = (command.args or "").strip()
     if not arg.startswith("join_"):
-        # не наш формат — отдаём обычное приветствие
         await state.clear()
         await message.answer("👋 Привет! Жми /start для меню.",
                              reply_markup=main_menu())
@@ -43,7 +41,6 @@ async def start_deeplink(message: Message, command: CommandObject,
         return
 
     await db.add_member(pack["name"], user.id, user.username)
-    # сразу переводим в режим добавления медиа в этот пак
     await state.clear()
     await state.set_state(NewPack.waiting_media)
     await state.update_data(
@@ -60,7 +57,6 @@ async def start_deeplink(message: Message, command: CommandObject,
     )
 
 
-# ---------- ссылка-приглашение ----------
 @router.callback_query(F.data.startswith("invite:"))
 async def show_invite(call: CallbackQuery):
     name = call.data.split(":", 1)[1]
@@ -69,15 +65,22 @@ async def show_invite(call: CallbackQuery):
         await call.answer("Это не совместный пак.", show_alert=True)
         return
     link = invite_link(pack["join_token"])
-    await call.message.answer(
-        f"🔗 Ссылка-приглашение в <b>{pack['title']}</b>:\n\n"
-        f"{link}\n\n"
-        "Кто перейдёт — сможет добавлять стикеры в этот пак."
-    )
+    # ПУНКТ 2: редактируем сообщение вместо отправки нового
+    try:
+        await call.message.edit_text(
+            f"🔗 Ссылка-приглашение в <b>{pack['title']}</b>:\n\n"
+            f"{link}\n\n"
+            "Кто перейдёт — сможет добавлять стикеры в этот пак."
+        )
+    except Exception:
+        await call.message.answer(
+            f"🔗 Ссылка-приглашение в <b>{pack['title']}</b>:\n\n"
+            f"{link}\n\n"
+            "Кто перейдёт — сможет добавлять стикеры в этот пак."
+        )
     await call.answer()
 
 
-# ---------- список участников (только владелец) ----------
 @router.callback_query(F.data.startswith("members:"))
 async def show_members(call: CallbackQuery):
     name = call.data.split(":", 1)[1]
@@ -98,12 +101,16 @@ async def show_members(call: CallbackQuery):
     text = (f"👥 Участники <b>{pack['title']}</b> ({len(members)}):\n\n"
             + "\n".join(lines) +
             "\n\nНажми на участника ниже, чтобы исключить.")
-    await call.message.answer(
-        text, reply_markup=members_kb(name, members, pack["owner_id"]))
+    # ПУНКТ 2: редактируем вместо нового сообщения
+    try:
+        await call.message.edit_text(
+            text, reply_markup=members_kb(name, members, pack["owner_id"]))
+    except Exception:
+        await call.message.answer(
+            text, reply_markup=members_kb(name, members, pack["owner_id"]))
     await call.answer()
 
 
-# ---------- кик участника ----------
 @router.callback_query(F.data.startswith("kick:"))
 async def kick_member(call: CallbackQuery):
     _, name, uid = call.data.split(":", 2)
