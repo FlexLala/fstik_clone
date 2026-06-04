@@ -1,0 +1,25 @@
+[Unit]
+Description=fStik clone Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=/opt/fstik_clone
+ExecStart=/opt/fstik_clone/.venv/bin/python /opt/fstik_clone/main.py
+Restart=always
+RestartSec=5
+
+# --- лимиты под Ryzen 1 ядро / 2 ГБ ---
+# ffmpeg прожорлив: даём боту максимум ~1.3 ГБ и не даём занять всё ядро,
+# чтобы другие боты не задохнулись.
+MemoryMax=1300M
+MemoryHigh=1100M
+CPUQuota=85%
+# мягкий приоритет: бот уступает CPU при конкуренции
+Nice=5
+CPUWeight=70
+
+[Install]
+WantedBy=multi-user.target
