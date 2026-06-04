@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS members (
     PRIMARY KEY (pack_name, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    user_id     INTEGER PRIMARY KEY,
+    max_side    INTEGER NOT NULL DEFAULT 512
+);
 """
 
 
@@ -43,7 +48,6 @@ async def init_db() -> None:
 
 async def add_pack(owner_id: int, name: str, title: str, pack_type: str,
                    media_kind: str, is_shared: bool = False) -> str | None:
-    """Создаёт запись пака. Для совместного генерирует join_token."""
     token = secrets.token_urlsafe(8) if is_shared else None
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -55,7 +59,6 @@ async def add_pack(owner_id: int, name: str, title: str, pack_type: str,
         )
         await db.commit()
     if is_shared:
-        # владелец — тоже участник
         await add_member(name, owner_id, None)
     return token
 
@@ -79,7 +82,6 @@ async def get_pack_by_token(token: str) -> Optional[dict]:
 
 
 async def list_packs(owner_id: int) -> list[dict]:
-    """Паки, где пользователь владелец ИЛИ участник."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -134,3 +136,24 @@ async def list_members(pack_name: str) -> list[dict]:
         ) as cur:
             rows = await cur.fetchall()
             return [dict(r) for r in rows]
+
+
+# --- ПУНКТ 3: настройки пользователя ---
+async def get_user_max_side(user_id: int) -> int:
+    """Возвращает максимальную сторону стикера для пользователя (по умолчанию 512)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT max_side FROM user_settings WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 512
+
+
+async def set_user_max_side(user_id: int, max_side: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_settings(user_id, max_side) VALUES(?,?)"
+            " ON CONFLICT(user_id) DO UPDATE SET max_side=excluded.max_side",
+            (user_id, max_side),
+        )
+        await db.commit()
