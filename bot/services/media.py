@@ -1,17 +1,8 @@
 """
 Сервис обработки медиа под требования Telegram.
-
-Решает обе боли пользователя:
-1) Сам определяет, что прислали (фото / видео / гиф / анимированный webp/webm),
-   и автоматически делает либо СТАТИЧНЫЙ (.webp/.png), либо ВИДЕО (.webm/vp9) стикер.
-2) Сам подгоняет пропорции: длинная сторона = 512px (для стикера) или 100x100 (эмодзи),
-   ничего обрезать не нужно — добавляет прозрачные поля при необходимости.
-
-Требования Telegram (на 2024+):
-  Статичный стикер: .webp/.png, одна сторона ровно 512px, вторая <= 512px.
-  Видео-стикер: .webm (VP9), одна сторона ровно 512px, длительность <= 3с,
-                до 30 FPS, <= 256 KB, без аудио, желательно зацикленный.
-  Эмодзи: ровно 100x100 (и для статики, и для видео).
+ИЗМЕНЕНИЯ:
+  - ПУНКТ 3: process() принимает max_side (кастомный размер от пользователя)
+  - ПУНКТ 4: process() принимает speed_up=True для ускорения видео вместо обрезки
 """
 from __future__ import annotations
 
@@ -26,7 +17,7 @@ from PIL import Image
 
 from bot.config import config, TMP_DIR
 
-STICKER_SIDE = 512
+STICKER_SIDE_DEFAULT = 512
 EMOJI_SIDE = 100
 VIDEO_MAX_DURATION = 2.9
 VIDEO_MAX_FPS = 30
@@ -62,6 +53,9 @@ class ConvertResult:
     height: int
     size_bytes: int
     note: str = ""
+    # ПУНКТ 4: был ли оригинал длиннее 3 сек (чтобы предложить ускорение)
+    was_too_long: bool = False
+    original_duration: float = 0.0
 
 
 class MediaError(Exception):
@@ -117,12 +111,14 @@ async def probe(src: Path) -> ProbeResult:
     return ProbeResult(kind, width, height, duration, has_audio, fps)
 
 
-def _target_box(target: StickerTarget) -> int:
-    return EMOJI_SIDE if target == StickerTarget.EMOJI else STICKER_SIDE
+def _target_box(target: StickerTarget, max_side: int = STICKER_SIDE_DEFAULT) -> int:
+    # ПУНКТ 3: для стикеров используем max_side, для эмодзи всегда 100
+    return EMOJI_SIDE if target == StickerTarget.EMOJI else max_side
 
 
-def _convert_static(src: Path, dst: Path, target: StickerTarget) -> ConvertResult:
-    box = _target_box(target)
+def _convert_static(src: Path, dst: Path, target: StickerTarget,
+                    max_side: int = STICKER_SIDE_DEFAULT) -> ConvertResult:
+    box = _target_box(target, max_side)
     img = Image.open(src).convert("RGBA")
     w, h = img.size
 
@@ -136,7 +132,7 @@ def _convert_static(src: Path, dst: Path, target: StickerTarget) -> ConvertResul
         scale = box / max(w, h)
         new = (max(1, round(w * scale)), max(1, round(h * scale)))
         out = img.resize(new, Image.LANCZOS)
-        note = f"Масштаб до {out.width}x{out.height} (длинная сторона 512)."
+        note = f"Масштаб до {out.width}x{out.height} (длинная сторона {box}px)."
 
     out.save(dst, format="WEBP", quality=95, method=6)
     size = dst.stat().st_size
@@ -149,32 +145,51 @@ def _convert_static(src: Path, dst: Path, target: StickerTarget) -> ConvertResul
     return ConvertResult(dst, MediaKind.STATIC, out.width, out.height, size, note)
 
 
-async def _convert_video(src: Path, dst: Path, target: StickerTarget, info: ProbeResult) -> ConvertResult:
-    box = _target_box(target)
+async def _convert_video(src: Path, dst: Path, target: StickerTarget,
+                          info: ProbeResult, max_side: int = STICKER_SIDE_DEFAULT,
+                          speed_up: bool = False) -> ConvertResult:
+    """
+    ПУНКТ 4: если speed_up=True — ускоряем видео до 3 сек с setpts,
+             иначе — обрезаем (старое поведение).
+    """
+    box = _target_box(target, max_side)
     ffmpeg = config.ffmpeg_bin if config else "ffmpeg"
 
+    was_too_long = info.duration > VIDEO_MAX_DURATION
+    notes = []
+
     if target == StickerTarget.EMOJI:
-        vf = (
+        vf_base = (
             f"scale={box}:{box}:force_original_aspect_ratio=decrease,"
             f"pad={box}:{box}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,"
             f"fps={VIDEO_MAX_FPS}"
         )
     else:
-        vf = (
+        vf_base = (
             f"scale='if(gt(iw,ih),{box},-2)':'if(gt(iw,ih),-2,{box})',"
             f"fps={VIDEO_MAX_FPS}"
         )
 
-    notes = []
-    if info.duration > VIDEO_MAX_DURATION:
-        notes.append(f"обрезано до {VIDEO_MAX_DURATION}с (было {info.duration:.1f}с)")
+    # ПУНКТ 4: ускорение вместо обрезки
+    if was_too_long and speed_up:
+        ratio = info.duration / VIDEO_MAX_DURATION
+        speed_factor = round(ratio, 4)
+        vf = f"setpts={1/speed_factor:.4f}*PTS," + vf_base
+        notes.append(f"ускорено в {speed_factor:.1f}x (было {info.duration:.1f}с)")
+        t_limit = info.duration  # отдаём весь файл, ускоряем через фильтр
+    else:
+        vf = vf_base
+        if was_too_long:
+            notes.append(f"обрезано до {VIDEO_MAX_DURATION}с (было {info.duration:.1f}с)")
+        t_limit = VIDEO_MAX_DURATION
+
     if info.has_audio:
         notes.append("удалён звук")
 
     for crf, bitrate in ((32, "400k"), (40, "260k"), (50, "180k"), (56, "120k")):
         code, _, err = await _run(
             ffmpeg, "-y",
-            "-t", f"{VIDEO_MAX_DURATION}",
+            "-t", f"{t_limit}",
             "-i", str(src),
             "-vf", vf,
             "-c:v", "libvpx-vp9",
@@ -197,17 +212,16 @@ async def _convert_video(src: Path, dst: Path, target: StickerTarget, info: Prob
 
     final = await probe(dst)
     note = "Видео-стикер VP9/WEBM. " + (", ".join(notes) if notes else "")
-    return ConvertResult(dst, MediaKind.VIDEO, final.width, final.height, size, note.strip())
+    return ConvertResult(
+        dst, MediaKind.VIDEO, final.width, final.height, size, note.strip(),
+        was_too_long=was_too_long,
+        original_duration=info.duration,
+    )
 
 
-async def _static_to_webm(src: Path, dst: Path, target: StickerTarget) -> ConvertResult:
-    """Превращаем статичную картинку в зацикленный VP9/WEBM (~1с).
-
-    Нужно для ЕДИНОГО пака: чтобы статика и видео лежали вместе, всё приводим
-    к video-стикерам. Картинку нормализуем через Pillow (размер/альфа),
-    затем ffmpeg делает из одного кадра короткое зацикленное видео.
-    """
-    box = _target_box(target)
+async def _static_to_webm(src: Path, dst: Path, target: StickerTarget,
+                           max_side: int = STICKER_SIDE_DEFAULT) -> ConvertResult:
+    box = _target_box(target, max_side)
     ffmpeg = config.ffmpeg_bin if config else "ffmpeg"
 
     norm = TMP_DIR / f"{src.stem}_norm.png"
@@ -256,8 +270,9 @@ async def _static_to_webm(src: Path, dst: Path, target: StickerTarget) -> Conver
 
 
 async def process(src: Path, target: StickerTarget,
-                  force_video: bool = False) -> ConvertResult:
-    """force_video=True -> даже статику приводим к video-стикеру (.webm)."""
+                  force_video: bool = False,
+                  max_side: int = STICKER_SIDE_DEFAULT,
+                  speed_up: bool = False) -> ConvertResult:
     if shutil.which((config.ffmpeg_bin if config else "ffmpeg")) is None:
         raise MediaError("FFmpeg не найден. Установи: sudo apt install ffmpeg")
 
@@ -265,10 +280,10 @@ async def process(src: Path, target: StickerTarget,
     stem = src.stem
     if info.kind == MediaKind.STATIC and not force_video:
         dst = TMP_DIR / f"{stem}_out.webp"
-        return await asyncio.to_thread(_convert_static, src, dst, target)
+        return await asyncio.to_thread(_convert_static, src, dst, target, max_side)
     elif info.kind == MediaKind.STATIC and force_video:
         dst = TMP_DIR / f"{stem}_out.webm"
-        return await _static_to_webm(src, dst, target)
+        return await _static_to_webm(src, dst, target, max_side)
     else:
         dst = TMP_DIR / f"{stem}_out.webm"
-        return await _convert_video(src, dst, target, info)
+        return await _convert_video(src, dst, target, info, max_side, speed_up)
