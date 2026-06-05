@@ -278,6 +278,7 @@ async def process(src: Path, target: StickerTarget,
 
     info = await probe(src)
     stem = src.stem
+
     if info.kind == MediaKind.STATIC and not force_video:
         dst = TMP_DIR / f"{stem}_out.webp"
         return await asyncio.to_thread(_convert_static, src, dst, target, max_side)
@@ -286,4 +287,8 @@ async def process(src: Path, target: StickerTarget,
         return await _static_to_webm(src, dst, target, max_side)
     else:
         dst = TMP_DIR / f"{stem}_out.webm"
-        return await _convert_video(src, dst, target, info, max_side, speed_up)
+        result = await _convert_video(src, dst, target, info, max_side, speed_up)
+        # Если speed_up уже применён — не сигнализируем was_too_long повторно
+        if speed_up:
+            result.was_too_long = False
+        return result
