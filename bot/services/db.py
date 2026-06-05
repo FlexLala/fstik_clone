@@ -1,4 +1,4 @@
-"""Хранилище на SQLite: паки, участники совместных паков, токены приглашений."""
+"""Хранилище на SQLite."""
 from __future__ import annotations
 
 import secrets
@@ -11,51 +11,71 @@ from bot.config import DB_PATH
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS packs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id    INTEGER NOT NULL,
-    name        TEXT NOT NULL UNIQUE,
-    title       TEXT NOT NULL,
-    pack_type   TEXT NOT NULL,      -- 'sticker' | 'emoji'
-    media_kind  TEXT NOT NULL,      -- 'static' | 'video' | 'unified'
-    is_shared   INTEGER NOT NULL DEFAULT 0,
-    join_token  TEXT,               -- токен для ссылки-приглашения
-    created_at  INTEGER NOT NULL
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id     INTEGER NOT NULL,
+    name         TEXT NOT NULL UNIQUE,
+    title        TEXT NOT NULL,
+    pack_type    TEXT NOT NULL,
+    media_kind   TEXT NOT NULL,
+    is_shared    INTEGER NOT NULL DEFAULT 0,
+    join_token   TEXT,
+    max_members  INTEGER NOT NULL DEFAULT 0,   -- 0 = без лимита
+    created_at   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_packs_owner ON packs(owner_id);
 CREATE INDEX IF NOT EXISTS idx_packs_token ON packs(join_token);
 
 CREATE TABLE IF NOT EXISTS members (
-    pack_name   TEXT NOT NULL,
-    user_id     INTEGER NOT NULL,
-    username    TEXT,
-    joined_at   INTEGER NOT NULL,
+    pack_name    TEXT NOT NULL,
+    user_id      INTEGER NOT NULL,
+    username     TEXT,
+    notify       INTEGER NOT NULL DEFAULT 1,   -- уведомления вкл/выкл
+    joined_at    INTEGER NOT NULL,
     PRIMARY KEY (pack_name, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_members_user ON members(user_id);
 
 CREATE TABLE IF NOT EXISTS user_settings (
-    user_id     INTEGER PRIMARY KEY,
-    max_side    INTEGER NOT NULL DEFAULT 512
+    user_id      INTEGER PRIMARY KEY,
+    max_side     INTEGER NOT NULL DEFAULT 512,
+    fit_mode     TEXT    NOT NULL DEFAULT 'fit',
+    sharpen      INTEGER NOT NULL DEFAULT 1
 );
 """
+
+# --- миграции для существующих БД ---
+_MIGRATIONS = [
+    "ALTER TABLE packs ADD COLUMN max_members INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN notify INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE user_settings ADD COLUMN fit_mode TEXT NOT NULL DEFAULT 'fit'",
+    "ALTER TABLE user_settings ADD COLUMN sharpen INTEGER NOT NULL DEFAULT 1",
+]
 
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(_SCHEMA)
+        # применяем миграции — ошибки игнорируем (колонка уже есть)
+        for sql in _MIGRATIONS:
+            try:
+                await db.execute(sql)
+            except Exception:
+                pass
         await db.commit()
 
 
+# ─── паки ────────────────────────────────────────────────
 async def add_pack(owner_id: int, name: str, title: str, pack_type: str,
-                   media_kind: str, is_shared: bool = False) -> str | None:
+                   media_kind: str, is_shared: bool = False,
+                   max_members: int = 0) -> str | None:
     token = secrets.token_urlsafe(8) if is_shared else None
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO packs"
-            "(owner_id,name,title,pack_type,media_kind,is_shared,join_token,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?)",
+            "(owner_id,name,title,pack_type,media_kind,is_shared,join_token,max_members,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
             (owner_id, name, title, pack_type, media_kind,
-             int(is_shared), token, int(time.time())),
+             int(is_shared), token, max_members, int(time.time())),
         )
         await db.commit()
     if is_shared:
@@ -95,15 +115,39 @@ async def list_packs(owner_id: int) -> list[dict]:
             return [dict(r) for r in rows]
 
 
-# --- участники совместных паков ---
-async def add_member(pack_name: str, user_id: int, username: str | None) -> None:
+async def rename_pack(name: str, new_title: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO members(pack_name,user_id,username,joined_at)"
-            " VALUES(?,?,?,?)",
+            "UPDATE packs SET title=? WHERE name=?", (new_title, name)
+        )
+        await db.commit()
+
+
+async def set_pack_max_members(name: str, max_members: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE packs SET max_members=? WHERE name=?", (max_members, name)
+        )
+        await db.commit()
+
+
+# ─── участники ───────────────────────────────────────────
+async def add_member(pack_name: str, user_id: int,
+                     username: str | None) -> bool:
+    """Добавляет участника. Возвращает False если достигнут лимит."""
+    pack = await get_pack(pack_name)
+    if pack and pack.get("max_members", 0) > 0:
+        members = await list_members(pack_name)
+        if len(members) >= pack["max_members"]:
+            return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO members(pack_name,user_id,username,notify,joined_at)"
+            " VALUES(?,?,?,1,?)",
             (pack_name, user_id, username, int(time.time())),
         )
         await db.commit()
+    return True
 
 
 async def remove_member(pack_name: str, user_id: int) -> None:
@@ -138,22 +182,62 @@ async def list_members(pack_name: str) -> list[dict]:
             return [dict(r) for r in rows]
 
 
-# --- ПУНКТ 3: настройки пользователя ---
-async def get_user_max_side(user_id: int) -> int:
-    """Возвращает максимальную сторону стикера для пользователя (по умолчанию 512)."""
+async def set_member_notify(pack_name: str, user_id: int, notify: bool) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE members SET notify=? WHERE pack_name=? AND user_id=?",
+            (int(notify), pack_name, user_id),
+        )
+        await db.commit()
+
+
+async def get_notifiable_members(pack_name: str,
+                                  exclude_user_id: int) -> list[dict]:
+    """Участники с включёнными уведомлениями (кроме того, кто добавил)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT max_side FROM user_settings WHERE user_id=?", (user_id,)
+            "SELECT * FROM members WHERE pack_name=? AND notify=1 AND user_id!=?",
+            (pack_name, exclude_user_id),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+# ─── настройки пользователя ──────────────────────────────
+async def get_user_settings(user_id: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM user_settings WHERE user_id=?", (user_id,)
         ) as cur:
             row = await cur.fetchone()
-            return row[0] if row else 512
+            if row:
+                return dict(row)
+            return {"user_id": user_id, "max_side": 512,
+                    "fit_mode": "fit", "sharpen": 1}
+
+
+async def get_user_max_side(user_id: int) -> int:
+    s = await get_user_settings(user_id)
+    return s["max_side"]
+
+
+async def set_user_settings(user_id: int, **kwargs) -> None:
+    current = await get_user_settings(user_id)
+    current.update(kwargs)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_settings(user_id,max_side,fit_mode,sharpen)"
+            " VALUES(?,?,?,?)"
+            " ON CONFLICT(user_id) DO UPDATE SET"
+            "  max_side=excluded.max_side,"
+            "  fit_mode=excluded.fit_mode,"
+            "  sharpen=excluded.sharpen",
+            (user_id, current["max_side"], current["fit_mode"], current["sharpen"]),
+        )
+        await db.commit()
 
 
 async def set_user_max_side(user_id: int, max_side: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO user_settings(user_id, max_side) VALUES(?,?)"
-            " ON CONFLICT(user_id) DO UPDATE SET max_side=excluded.max_side",
-            (user_id, max_side),
-        )
-        await db.commit()
+    await set_user_settings(user_id, max_side=max_side)
