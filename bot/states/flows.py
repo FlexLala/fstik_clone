@@ -2,12 +2,17 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class NewPack(StatesGroup):
-    choosing_target = State()    # стикеры или эмодзи
-    choosing_kind = State()      # статичный / видео / единый
-    choosing_shared = State()    # личный / совместный
-    entering_title = State()     # название набора
-    waiting_media = State()      # ждём медиа
-    confirming = State()         # предпросмотр
-    waiting_emoji = State()      # эмодзи для стикера
-    setting_max_side = State()   # ввод кастомного размера (пункт 3)
-    speed_confirm = State()      # подтверждение ускорения видео (пункт 4)
+    choosing_target = State()
+    choosing_kind = State()
+    choosing_shared = State()
+    entering_title = State()
+    waiting_media = State()
+    confirming = State()
+    waiting_emoji = State()
+    setting_max_side = State()
+    speed_confirm = State()
+
+
+class ManagePack(StatesGroup):
+    entering_new_title = State()   # переименование
+    entering_limit = State()       # лимит участников
