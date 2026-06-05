@@ -3,7 +3,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
-from bot.keyboards.menus import main_menu, my_packs_kb, pack_menu_kb, size_settings_kb
+from bot.keyboards.menus import (main_menu, my_packs_kb, pack_menu_kb,
+                                 size_settings_kb, reply_menu, choose_target)
 from bot.services.db import get_pack, get_user_max_side, list_packs, set_user_max_side
 from bot.states.flows import NewPack
 
@@ -33,9 +34,10 @@ HELP = (
 @router.message(CommandStart(deep_link=False))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    # Сначала показываем reply-клавиатуру (нижняя панель)
     await message.answer(
         WELCOME.format(name=message.from_user.first_name),
-        reply_markup=main_menu(),
+        reply_markup=reply_menu(),
     )
 
 
@@ -112,6 +114,42 @@ async def pack_menu(call: CallbackQuery):
 
 
 # ПУНКТ 3: настройки размера
+# ─── Обработчики кнопок нижней reply-панели ───────────────
+@router.message(F.text == "➕ Новый пак")
+async def reply_new_pack(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(NewPack.choosing_target)
+    await message.answer("📦 <b>Новый пак</b>\nЧто создаём?",
+                         reply_markup=choose_target())
+
+
+@router.message(F.text == "📁 Мои паки")
+async def reply_my_packs(message: Message):
+    packs = await list_packs(message.from_user.id)
+    if not packs:
+        await message.answer("У тебя пока нет паков. Создай первый!",
+                             reply_markup=main_menu())
+    else:
+        await message.answer(f"📁 Твои паки ({len(packs)}):",
+                             reply_markup=my_packs_kb(packs, message.from_user.id))
+
+
+@router.message(F.text == "❓ Помощь")
+async def reply_help(message: Message):
+    await message.answer(HELP, reply_markup=main_menu())
+
+
+@router.message(F.text == "⚙️ Настройки")
+async def reply_settings(message: Message):
+    current = await get_user_max_side(message.from_user.id)
+    await message.answer(
+        f"📐 <b>Размер стикера</b>\n\n"
+        f"Текущий максимум длинной стороны: <b>{current}px</b>\n\n"
+        "Выбери новый размер или введи свой (от 50 до 512):",
+        reply_markup=size_settings_kb(current),
+    )
+
+
 @router.message(Command("settings"))
 async def settings_cmd(message: Message):
     current = await get_user_max_side(message.from_user.id)
