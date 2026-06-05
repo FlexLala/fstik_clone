@@ -214,6 +214,9 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
     # ПУНКТ 3: читаем кастомный размер пользователя
     max_side = await db.get_user_max_side(message.from_user.id)
 
+    # ПУНКТ 4: читаем флаг speed_up из FSM (установлен после выбора пользователя)
+    speed_up = bool(data.get("speed_up", False))
+
     src = await _download(message, bot)
     if not src:
         await message.answer("Не смог получить файл. Пришли фото/видео/GIF.")
@@ -226,7 +229,8 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
         status = await message.answer("⏳ Обрабатываю...")
 
     async def _do():
-        return await process(src, target, force_video=force_video, max_side=max_side)
+        return await process(src, target, force_video=force_video,
+                             max_side=max_side, speed_up=speed_up)
 
     try:
         result = await media_queue.run(_do)
@@ -245,8 +249,9 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
 
     await _delete(status)  # ПУНКТ 2: удаляем «⏳ Обрабатываю...»
 
-    # ПУНКТ 4: если видео было слишком длинным — предлагаем ускорить
-    if result.was_too_long:
+    # ПУНКТ 4: если видео слишком длинное И флаг speed_up ещё не выбран — спрашиваем
+    # Если speed_up уже установлен — сразу показываем превью (цикл исключён)
+    if result.was_too_long and not speed_up:
         await state.update_data(
             out_path=str(result.path),
             media_kind=result.kind.value,
@@ -264,36 +269,34 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
         await state.set_state(NewPack.speed_confirm)
         return
 
+    # Сбрасываем флаг speed_up после успешной обработки
+    await state.update_data(speed_up=False)
     await _show_preview(message, state, result)
 
 
 # ПУНКТ 4: обработка выбора ускорения/обрезки
 @router.callback_query(NewPack.speed_confirm, F.data.startswith("speed:"))
-async def speed_choice(call: CallbackQuery, state: FSMContext, bot: Bot):
+async def speed_choice(call: CallbackQuery, state: FSMContext):
     choice = call.data.split(":", 1)[1]
     data = await state.get_data()
-    target = StickerTarget(data.get("target", "sticker"))
-    pack_kind = data.get("pack_kind", "static")
-    force_video = pack_kind in ("video", "unified")
-    max_side = await db.get_user_max_side(call.from_user.id)
     speed_up = (choice == "up")
 
-    # Удалить старый результат (он был обрезан по умолчанию)
+    # Удаляем старый обрезанный результат — он нам не нужен
     old_path = Path(data["out_path"]) if data.get("out_path") else None
     if old_path:
         old_path.unlink(missing_ok=True)
+    await state.update_data(out_path=None)
 
-    # Нам нужен оригинальный файл — пользователь должен прислать снова?
-    # Нет, мы сохраняем путь к src до удаления. Проблема: src уже удалён.
-    # Решение: просим пользователя прислать снова с пометкой в FSM.
-    # Но лучше — не удалять src до этого момента.
-    # Здесь мы уже потеряли src, поэтому честно скажем переслать.
-    await call.message.edit_text(
-        "🔄 Понял! Пришли это видео ещё раз — я обработаю его "
-        f"{'с ускорением' if speed_up else 'с обрезкой до 3 сек'}."
-    )
+    # Сохраняем выбор и просим прислать видео ещё раз
+    # (оригинал уже удалён, поэтому просим переслать — без нового вопроса)
     await state.update_data(speed_up=speed_up)
     await state.set_state(NewPack.waiting_media)
+
+    action = "с ускорением ⚡" if speed_up else "с обрезкой до 3 сек ✂️"
+    await call.message.edit_text(
+        f"🔄 Понял! Пришли это видео ещё раз — обработаю {action}.\n\n"
+        "На этот раз вопросов задавать не буду 😊"
+    )
     await call.answer()
 
 
