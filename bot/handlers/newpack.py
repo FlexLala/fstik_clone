@@ -25,7 +25,7 @@ from bot.keyboards.menus import (after_add, choose_kind, choose_shared,
                                  speed_up_kb)
 from bot.services import db, stickers
 from bot.services.media import (MediaError, MediaKind, StickerTarget,
-                                process, probe)
+                                FitMode, process, probe)
 from bot.services.queue import media_queue
 from bot.states.flows import NewPack
 
@@ -213,6 +213,12 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Не смог получить файл. Пришли фото/видео/GIF.")
         return
 
+    # Читаем настройки пользователя
+    s = await db.get_user_settings(message.from_user.id)
+    max_side = s.get("max_side", 512)
+    fit_mode = FitMode(s.get("fit_mode", "fit"))
+    sharpen = bool(s.get("sharpen", True))
+
     status = await message.answer("⏳ Обрабатываю...")
 
     # Быстро смотрим длительность через probe (без конвертации)
@@ -230,6 +236,8 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
             src_path=str(src),
             force_video=force_video,
             max_side=max_side,
+            fit_mode=fit_mode.value,
+            sharpen=int(sharpen),
             target=target.value,
             original_duration=info.duration,
             emoji=[],
@@ -245,7 +253,8 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
 
     # Обычная конвертация
     async def _do():
-        return await process(src, target, force_video=force_video, max_side=max_side)
+        return await process(src, target, force_video=force_video,
+                             max_side=max_side, fit_mode=fit_mode, sharpen=sharpen)
 
     try:
         result = await media_queue.run(_do)
@@ -285,6 +294,8 @@ async def speed_choice(call: CallbackQuery, state: FSMContext):
     target = StickerTarget(data.get("target", "sticker"))
     force_video = data.get("force_video", True)
     max_side = data.get("max_side", 512)
+    fit_mode = FitMode(data.get("fit_mode", "fit"))
+    sharpen = bool(data.get("sharpen", True))
     speed_up = (choice == "up")
 
     action_text = "⚡ Ускоряю..." if speed_up else "✂️ Обрезаю до 3 сек..."
@@ -293,7 +304,8 @@ async def speed_choice(call: CallbackQuery, state: FSMContext):
 
     async def _do():
         return await process(src, target, force_video=force_video,
-                             max_side=max_side, speed_up=speed_up)
+                             max_side=max_side, speed_up=speed_up,
+                             fit_mode=fit_mode, sharpen=sharpen)
 
     try:
         result = await media_queue.run(_do)
@@ -425,6 +437,22 @@ async def confirm_add(call: CallbackQuery, state: FSMContext, bot: Bot):
     Path(data["out_path"]).unlink(missing_ok=True)
     await state.update_data(pack_name=name, out_path=None)
     is_owner = (owner_id == user_id)
+
+    # ИДЕЯ 9: уведомляем участников совместного пака
+    if existing and existing["is_shared"]:
+        who = call.from_user.username and f"@{call.from_user.username}" \
+              or call.from_user.first_name
+        notifiable = await db.get_notifiable_members(name, user_id)
+        for m in notifiable:
+            try:
+                await bot.send_message(
+                    m["user_id"],
+                    f"🖼 <b>{who}</b> добавил стикер в пак «{title}»!\n"
+                    f"📦 <a href='https://t.me/addstickers/{name}'>Открыть пак</a>",
+                    disable_notification=True,
+                )
+            except Exception:
+                pass  # пользователь заблокировал бота — не страшно
 
     try:
         await call.message.edit_caption(
