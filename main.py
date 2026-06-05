@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 from bot.config import load_config
-from bot.handlers import newpack, shared, start
+from bot.handlers import newpack, shared, start, manage
 from bot.services.db import init_db
 
 logging.basicConfig(
@@ -35,6 +35,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(shared.router)   # deep-link join первым
     dp.include_router(start.router)
+    dp.include_router(manage.router)
     dp.include_router(newpack.router)
 
     # Регистрируем команды — они появятся в меню с 3 полосками
