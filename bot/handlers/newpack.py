@@ -1,10 +1,12 @@
 """
 Поток создания / редактирования пака.
-ИЗМЕНЕНИЯ:
-  - ПУНКТ 1: edit_pack — возврат к добавлению стикеров в существующий пак
-  - ПУНКТ 2: удаляем промежуточные сообщения (статус обработки и др.)
-  - ПУНКТ 3: читаем max_side из БД настроек пользователя
-  - ПУНКТ 4: если видео > 3с — предлагаем ускорить или обрезать
+
+Логика длинного видео:
+  1. Пользователь присылает видео
+  2. Делаем probe (быстро, без конвертации)
+  3. Если > 3 сек — сразу спрашиваем: ускорить или обрезать (оригинал сохранён)
+  4. После выбора — конвертируем оригинал с нужным флагом
+  Итого: одна отправка видео, один вопрос, одна конвертация.
 """
 from __future__ import annotations
 
@@ -22,14 +24,14 @@ from bot.keyboards.menus import (after_add, choose_kind, choose_shared,
                                  choose_target, confirm_sticker, main_menu,
                                  speed_up_kb)
 from bot.services import db, stickers
-from bot.services.media import MediaError, MediaKind, StickerTarget, process
+from bot.services.media import (MediaError, MediaKind, StickerTarget,
+                                process, probe)
 from bot.services.queue import media_queue
 from bot.states.flows import NewPack
 
 router = Router()
 
 
-# ─── вспомогательная функция тихого удаления сообщения ───
 async def _delete(msg) -> None:
     try:
         await msg.delete()
@@ -42,7 +44,6 @@ async def _delete(msg) -> None:
 async def new_pack(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(NewPack.choosing_target)
-    # ПУНКТ 2: редактируем текущее сообщение
     try:
         await call.message.edit_text(
             "📦 <b>Новый пак</b>\nЧто создаём?",
@@ -56,7 +57,7 @@ async def new_pack(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ПУНКТ 1: редактировать (добавить в) существующий пак
+# ─── редактировать существующий пак ──────────────────────
 @router.callback_query(F.data.startswith("edit_pack:"))
 async def edit_pack(call: CallbackQuery, state: FSMContext):
     name = call.data.split(":", 1)[1]
@@ -65,7 +66,6 @@ async def edit_pack(call: CallbackQuery, state: FSMContext):
         await call.answer("Пак не найден.", show_alert=True)
         return
 
-    # Проверяем, есть ли у пользователя доступ
     user_id = call.from_user.id
     if pack["is_shared"]:
         if not await db.is_member(name, user_id):
@@ -84,8 +84,7 @@ async def edit_pack(call: CallbackQuery, state: FSMContext):
         title=pack["title"],
         pack_name=name,
         emoji=[],
-        speed_up=False,
-        pending_path=None,
+        src_path=None,
     )
     try:
         await call.message.edit_text(
@@ -125,10 +124,7 @@ async def pick_target(call: CallbackQuery, state: FSMContext):
             reply_markup=choose_kind(),
         )
     except Exception:
-        await call.message.answer(
-            "Выбери <b>вид</b> пака:",
-            reply_markup=choose_kind(),
-        )
+        await call.message.answer("Выбери вид пака:", reply_markup=choose_kind())
     await call.answer()
 
 
@@ -145,10 +141,7 @@ async def pick_kind(call: CallbackQuery, state: FSMContext):
             reply_markup=choose_shared(),
         )
     except Exception:
-        await call.message.answer(
-            "Пак будет личный или совместный?",
-            reply_markup=choose_shared(),
-        )
+        await call.message.answer("Личный или совместный?", reply_markup=choose_shared())
     await call.answer()
 
 
@@ -160,7 +153,7 @@ async def pick_shared(call: CallbackQuery, state: FSMContext):
     try:
         await call.message.edit_text("✏️ Введи <b>название</b> пака:")
     except Exception:
-        await call.message.answer("✏️ Введи <b>название</b> пака:")
+        await call.message.answer("✏️ Введи название пака:")
     await call.answer()
 
 
@@ -170,9 +163,8 @@ async def set_title(message: Message, state: FSMContext):
     if not title:
         await message.answer("Название не может быть пустым. Попробуй ещё раз.")
         return
-    await state.update_data(title=title)
+    await state.update_data(title=title, src_path=None)
     await state.set_state(NewPack.waiting_media)
-    # ПУНКТ 2: удаляем сообщение пользователя и отвечаем одним
     await _delete(message)
     await message.answer(
         "📤 Отправь мне <b>фото, видео, GIF или стикер</b>.\n"
@@ -180,6 +172,7 @@ async def set_title(message: Message, state: FSMContext):
     )
 
 
+# ─── скачивание файла ─────────────────────────────────────
 async def _download(message: Message, bot: Bot) -> Path | None:
     file_id = None
     suffix = ".bin"
@@ -205,6 +198,7 @@ async def _download(message: Message, bot: Bot) -> Path | None:
     return src
 
 
+# ─── приём медиа ─────────────────────────────────────────
 @router.message(NewPack.waiting_media, F.content_type.in_(
     {"photo", "video", "animation", "document", "sticker", "video_note"}))
 async def receive_media(message: Message, state: FSMContext, bot: Bot):
@@ -212,27 +206,46 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
     target = StickerTarget(data.get("target", "sticker"))
     pack_kind = data.get("pack_kind", "static")
     force_video = pack_kind in ("video", "unified")
-
-    # ПУНКТ 3: читаем кастомный размер пользователя
     max_side = await db.get_user_max_side(message.from_user.id)
-
-    # ПУНКТ 4: читаем флаг speed_up из FSM (установлен после выбора пользователя)
-    speed_up = bool(data.get("speed_up", False))
 
     src = await _download(message, bot)
     if not src:
         await message.answer("Не смог получить файл. Пришли фото/видео/GIF.")
         return
 
-    if not media_queue.has_free_slot:
-        pos = media_queue.waiting + 1
-        status = await message.answer(f"⏳ В очереди (позиция ~{pos})...")
-    else:
-        status = await message.answer("⏳ Обрабатываю...")
+    status = await message.answer("⏳ Обрабатываю...")
 
+    # Быстро смотрим длительность через probe (без конвертации)
+    try:
+        info = await probe(src)
+        is_too_long = (info.kind == MediaKind.VIDEO and info.duration > 3.0)
+    except Exception:
+        is_too_long = False
+        info = None
+
+    # Видео длиннее 3 сек — спрашиваем сразу, оригинал сохраняем
+    if is_too_long:
+        await _delete(status)
+        await state.update_data(
+            src_path=str(src),
+            force_video=force_video,
+            max_side=max_side,
+            target=target.value,
+            original_duration=info.duration,
+            emoji=[],
+        )
+        await message.answer(
+            f"⏱ Видео длиннее 3 секунд ({info.duration:.1f}с).\n\n"
+            f"⚡ <b>Ускорить</b> — весь ролик в 3 сек (x{info.duration / 3:.1f})\n"
+            "✂️ <b>Обрезать</b> — первые 3 сек",
+            reply_markup=speed_up_kb(),
+        )
+        await state.set_state(NewPack.speed_confirm)
+        return
+
+    # Обычная конвертация
     async def _do():
-        return await process(src, target, force_video=force_video,
-                             max_side=max_side, speed_up=speed_up)
+        return await process(src, target, force_video=force_video, max_side=max_side)
 
     try:
         result = await media_queue.run(_do)
@@ -249,87 +262,62 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
     finally:
         src.unlink(missing_ok=True)
 
-    await _delete(status)  # ПУНКТ 2: удаляем «⏳ Обрабатываю...»
-
-    # ПУНКТ 4: если видео слишком длинное И пользователь ещё не выбрал способ — спрашиваем.
-    # Если speed_up уже True — значит пользователь уже выбрал, не спрашиваем снова.
-    if result.was_too_long and not speed_up:
-        await state.update_data(
-            pending_path=str(result.path),   # сохраняем обрезанный результат
-            media_kind=result.kind.value,
-            original_duration=result.original_duration,
-            emoji=[],
-        )
-        await message.answer(
-            f"⏱ Видео длиннее 3 секунд ({result.original_duration:.1f}с).\n\n"
-            "Как поступим?\n"
-            "⚡ <b>Ускорить</b> — весь ролик уместится в 3 сек "
-            f"(ускорение в {result.original_duration / 3:.1f}x).\n"
-            "✂️ <b>Просто обрезать</b> — возьмём первые 3 сек.",
-            reply_markup=speed_up_kb(),
-        )
-        await state.set_state(NewPack.speed_confirm)
-        return
-
-    # speed_up уже выбран или видео короткое — сразу показываем превью
-    await state.update_data(speed_up=False)  # сбрасываем флаг
+    await _delete(status)
     await _show_preview(message, state, result)
 
 
-# ПУНКТ 4: обработка выбора ускорения/обрезки
+# ─── пользователь выбрал: ускорить или обрезать ──────────
 @router.callback_query(NewPack.speed_confirm, F.data.startswith("speed:"))
 async def speed_choice(call: CallbackQuery, state: FSMContext):
     choice = call.data.split(":", 1)[1]
     data = await state.get_data()
-    speed_up = (choice == "up")
 
-    if choice == "cut":
-        # Пользователь выбрал обрезку — у нас уже есть готовый обрезанный файл
-        pending = data.get("pending_path")
-        if pending and Path(pending).exists():
-            await state.update_data(out_path=pending, pending_path=None, speed_up=False)
-            await call.message.edit_text("✂️ Беру первые 3 секунды.")
-            await call.answer()
-            # Показываем превью напрямую из сохранённого файла
-            from bot.services.media import ConvertResult, MediaKind
-            kind = MediaKind(data["media_kind"])
-            p = Path(pending)
-            result = ConvertResult(
-                path=p, kind=kind,
-                width=0, height=0,
-                size_bytes=p.stat().st_size,
-                note="Обрезано до 3 сек.",
-            )
-            await _show_preview(call.message, state, result)
-            return
-        # Файл потерялся — просим прислать снова
-        await state.update_data(speed_up=False, pending_path=None)
+    src_path = data.get("src_path")
+    if not src_path or not Path(src_path).exists():
+        await call.message.edit_text(
+            "❌ Файл куда-то пропал. Пришли видео ещё раз."
+        )
         await state.set_state(NewPack.waiting_media)
-        await call.message.edit_text("📤 Пришли видео ещё раз — обрежу до 3 сек ✂️")
         await call.answer()
         return
 
-    # Пользователь выбрал ускорение — нужен оригинал, просим прислать снова
-    # Удаляем обрезанный вариант — он не нужен
-    pending = data.get("pending_path")
-    if pending:
-        Path(pending).unlink(missing_ok=True)
+    src = Path(src_path)
+    target = StickerTarget(data.get("target", "sticker"))
+    force_video = data.get("force_video", True)
+    max_side = data.get("max_side", 512)
+    speed_up = (choice == "up")
 
-    await state.update_data(speed_up=True, pending_path=None, out_path=None)
-    await state.set_state(NewPack.waiting_media)
-    await call.message.edit_text(
-        "⚡ Понял! Пришли это видео ещё раз — ускорю весь ролик до 3 сек.\n\n"
-        "Больше вопросов не будет 😊"
-    )
+    action_text = "⚡ Ускоряю..." if speed_up else "✂️ Обрезаю до 3 сек..."
+    await call.message.edit_text(action_text)
     await call.answer()
 
+    async def _do():
+        return await process(src, target, force_video=force_video,
+                             max_side=max_side, speed_up=speed_up)
 
+    try:
+        result = await media_queue.run(_do)
+    except MediaError as e:
+        src.unlink(missing_ok=True)
+        await call.message.edit_text(f"❌ {e}")
+        return
+    except Exception as e:
+        src.unlink(missing_ok=True)
+        await call.message.edit_text(f"❌ Ошибка: {e}")
+        return
+    finally:
+        src.unlink(missing_ok=True)
+
+    await state.update_data(src_path=None)
+    await _show_preview(call.message, state, result)
+
+
+# ─── предпросмотр ─────────────────────────────────────────
 async def _show_preview(message: Message, state: FSMContext, result) -> None:
     await state.update_data(
         out_path=str(result.path),
         media_kind=result.kind.value,
         emoji=[],
-        speed_up=False,
     )
     caption = (
         f"✅ Готово!\n"
@@ -362,7 +350,7 @@ async def save_emoji(message: Message, state: FSMContext):
     emojis = re.findall(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", message.text)[:3]
     await state.update_data(emoji=emojis or ["⭐"])
     await state.set_state(NewPack.confirming)
-    await _delete(message)  # ПУНКТ 2: убираем сообщение с эмодзи
+    await _delete(message)
     await message.answer(
         f"Эмодзи сохранены: {''.join(emojis) or '⭐'}\n"
         "Теперь жми «✅ Добавить в пак».",
@@ -418,15 +406,14 @@ async def confirm_add(call: CallbackQuery, state: FSMContext, bot: Bot):
     else:
         if existing["is_shared"] and not await db.is_member(name, user_id):
             await call.message.answer(
-                "🚫 Тебя нет среди участников этого пака "
-                "(возможно, тебя исключили). Добавление недоступно."
+                "🚫 Тебя нет среди участников этого пака. Добавление недоступно."
             )
             return
         db_kind = existing["media_kind"]
         if db_kind != "unified" and db_kind != kind.value:
             await call.message.answer(
-                "⚠️ В этом паке другой тип. Этот пак: "
-                f"<b>{db_kind}</b>. Создай отдельный пак или выбери «Единый»."
+                f"⚠️ В этом паке тип <b>{db_kind}</b>. "
+                "Создай отдельный пак или выбери «Единый»."
             )
             return
         try:
@@ -439,7 +426,6 @@ async def confirm_add(call: CallbackQuery, state: FSMContext, bot: Bot):
     await state.update_data(pack_name=name, out_path=None)
     is_owner = (owner_id == user_id)
 
-    # ПУНКТ 2: редактируем сообщение с предпросмотром вместо нового
     try:
         await call.message.edit_caption(
             caption=f"🎉 Стикер добавлен в <b>{title}</b>!",
@@ -460,6 +446,7 @@ async def add_more(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
     await state.set_state(NewPack.waiting_media)
+    await state.update_data(src_path=None)
     try:
         await call.message.edit_text("📤 Пришли следующее медиа для этого пака.")
     except Exception:
