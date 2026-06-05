@@ -1,6 +1,18 @@
 """Inline-меню в стиле fStikBot."""
-from aiogram.types import InlineKeyboardMarkup
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import (InlineKeyboardMarkup, ReplyKeyboardMarkup,
+                            KeyboardButton)
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+
+
+def reply_menu() -> ReplyKeyboardMarkup:
+    """Нижняя панель быстрых команд (кнопки под полем ввода)."""
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="➕ Новый пак")
+    kb.button(text="📁 Мои паки")
+    kb.button(text="⚙️ Настройки")
+    kb.button(text="❓ Помощь")
+    kb.adjust(2, 2)
+    return kb.as_markup(resize_keyboard=True, input_field_placeholder="Выбери действие...")
 
 
 def main_menu() -> InlineKeyboardMarkup:
