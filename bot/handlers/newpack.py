@@ -84,6 +84,8 @@ async def edit_pack(call: CallbackQuery, state: FSMContext):
         title=pack["title"],
         pack_name=name,
         emoji=[],
+        speed_up=False,
+        pending_path=None,
     )
     try:
         await call.message.edit_text(
@@ -249,11 +251,11 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
 
     await _delete(status)  # ПУНКТ 2: удаляем «⏳ Обрабатываю...»
 
-    # ПУНКТ 4: если видео слишком длинное И флаг speed_up ещё не выбран — спрашиваем
-    # Если speed_up уже установлен — сразу показываем превью (цикл исключён)
+    # ПУНКТ 4: если видео слишком длинное И пользователь ещё не выбрал способ — спрашиваем.
+    # Если speed_up уже True — значит пользователь уже выбрал, не спрашиваем снова.
     if result.was_too_long and not speed_up:
         await state.update_data(
-            out_path=str(result.path),
+            pending_path=str(result.path),   # сохраняем обрезанный результат
             media_kind=result.kind.value,
             original_duration=result.original_duration,
             emoji=[],
@@ -261,16 +263,16 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
         await message.answer(
             f"⏱ Видео длиннее 3 секунд ({result.original_duration:.1f}с).\n\n"
             "Как поступим?\n"
-            "⚡ <b>Ускорить</b> — весь ролик уместится в 3 сек (ускорение в "
-            f"{result.original_duration / 3:.1f}x).\n"
+            "⚡ <b>Ускорить</b> — весь ролик уместится в 3 сек "
+            f"(ускорение в {result.original_duration / 3:.1f}x).\n"
             "✂️ <b>Просто обрезать</b> — возьмём первые 3 сек.",
             reply_markup=speed_up_kb(),
         )
         await state.set_state(NewPack.speed_confirm)
         return
 
-    # Сбрасываем флаг speed_up после успешной обработки
-    await state.update_data(speed_up=False)
+    # speed_up уже выбран или видео короткое — сразу показываем превью
+    await state.update_data(speed_up=False)  # сбрасываем флаг
     await _show_preview(message, state, result)
 
 
@@ -281,21 +283,43 @@ async def speed_choice(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     speed_up = (choice == "up")
 
-    # Удаляем старый обрезанный результат — он нам не нужен
-    old_path = Path(data["out_path"]) if data.get("out_path") else None
-    if old_path:
-        old_path.unlink(missing_ok=True)
-    await state.update_data(out_path=None)
+    if choice == "cut":
+        # Пользователь выбрал обрезку — у нас уже есть готовый обрезанный файл
+        pending = data.get("pending_path")
+        if pending and Path(pending).exists():
+            await state.update_data(out_path=pending, pending_path=None, speed_up=False)
+            await call.message.edit_text("✂️ Беру первые 3 секунды.")
+            await call.answer()
+            # Показываем превью напрямую из сохранённого файла
+            from bot.services.media import ConvertResult, MediaKind
+            kind = MediaKind(data["media_kind"])
+            p = Path(pending)
+            result = ConvertResult(
+                path=p, kind=kind,
+                width=0, height=0,
+                size_bytes=p.stat().st_size,
+                note="Обрезано до 3 сек.",
+            )
+            await _show_preview(call.message, state, result)
+            return
+        # Файл потерялся — просим прислать снова
+        await state.update_data(speed_up=False, pending_path=None)
+        await state.set_state(NewPack.waiting_media)
+        await call.message.edit_text("📤 Пришли видео ещё раз — обрежу до 3 сек ✂️")
+        await call.answer()
+        return
 
-    # Сохраняем выбор и просим прислать видео ещё раз
-    # (оригинал уже удалён, поэтому просим переслать — без нового вопроса)
-    await state.update_data(speed_up=speed_up)
+    # Пользователь выбрал ускорение — нужен оригинал, просим прислать снова
+    # Удаляем обрезанный вариант — он не нужен
+    pending = data.get("pending_path")
+    if pending:
+        Path(pending).unlink(missing_ok=True)
+
+    await state.update_data(speed_up=True, pending_path=None, out_path=None)
     await state.set_state(NewPack.waiting_media)
-
-    action = "с ускорением ⚡" if speed_up else "с обрезкой до 3 сек ✂️"
     await call.message.edit_text(
-        f"🔄 Понял! Пришли это видео ещё раз — обработаю {action}.\n\n"
-        "На этот раз вопросов задавать не буду 😊"
+        "⚡ Понял! Пришли это видео ещё раз — ускорю весь ролик до 3 сек.\n\n"
+        "Больше вопросов не будет 😊"
     )
     await call.answer()
 
