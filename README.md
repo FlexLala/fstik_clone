@@ -1,4 +1,5 @@
-# 🎨 fStik-clone
+# 🎨 Telegram-stickerBOT-lite 
+(аналог fStik)
 
 > Telegram-бот для создания стикерпаков из фото, видео и GIF — быстро, без лишних кнопок.
 
