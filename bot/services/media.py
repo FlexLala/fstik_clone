@@ -1,8 +1,12 @@
 """
 Сервис обработки медиа под требования Telegram.
-ИЗМЕНЕНИЯ:
-  - ПУНКТ 3: process() принимает max_side (кастомный размер от пользователя)
-  - ПУНКТ 4: process() принимает speed_up=True для ускорения видео вместо обрезки
+
+Поддерживает:
+  - Фото/GIF -> статичный стикер (WebP)
+  - Видео/GIF -> видео-стикер (VP9/WebM, до 3 сек, без звука)
+  - Единый пак (статика конвертируется в зацикленное видео)
+  - Кастомный размер стикера
+  - Ускорение длинных видео вместо обрезки
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from bot.config import config, TMP_DIR
 
@@ -33,6 +37,12 @@ class MediaKind(str, Enum):
 class StickerTarget(str, Enum):
     STICKER = "sticker"
     EMOJI = "emoji"
+
+
+class FitMode(str, Enum):
+    """Режим подгонки изображения."""
+    FIT = "fit"      # Вписать с полями (сохранить пропорции)
+    CROP = "crop"    # Обрезать до квадрата
 
 
 @dataclass
@@ -73,7 +83,7 @@ async def _run(*args: str):
 
 
 async def probe(src: Path) -> ProbeResult:
-    ffprobe = config.ffprobe_bin if config else "ffprobe"
+    ffprobe = (config.ffprobe_bin if config and config.ffprobe_bin else "ffprobe")
     code, out, err = await _run(
         ffprobe, "-v", "error", "-print_format", "json",
         "-show_streams", "-show_format", str(src),
@@ -117,22 +127,39 @@ def _target_box(target: StickerTarget, max_side: int = STICKER_SIDE_DEFAULT) -> 
 
 
 def _convert_static(src: Path, dst: Path, target: StickerTarget,
-                    max_side: int = STICKER_SIDE_DEFAULT) -> ConvertResult:
+                    max_side: int = STICKER_SIDE_DEFAULT,
+                    fit_mode: FitMode = FitMode.FIT,
+                    sharpen: bool = True) -> ConvertResult:
     box = _target_box(target, max_side)
     img = Image.open(src).convert("RGBA")
     w, h = img.size
 
     if target == StickerTarget.EMOJI:
+        # Эмодзи всегда центрируем в квадрат
         img.thumbnail((box, box), Image.LANCZOS)
         canvas = Image.new("RGBA", (box, box), (0, 0, 0, 0))
         canvas.paste(img, ((box - img.width) // 2, (box - img.height) // 2), img)
         out = canvas
         note = "Приведено к 100x100 (эмодзи)."
     else:
-        scale = box / max(w, h)
-        new = (max(1, round(w * scale)), max(1, round(h * scale)))
-        out = img.resize(new, Image.LANCZOS)
-        note = f"Масштаб до {out.width}x{out.height} (длинная сторона {box}px)."
+        if fit_mode == FitMode.CROP:
+            # Обрезаем до квадрата (берём центр)
+            size = min(w, h)
+            left = (w - size) // 2
+            top = (h - size) // 2
+            img = img.crop((left, top, left + size, top + size))
+            out = img.resize((box, box), Image.LANCZOS)
+            note = f"Обрезано и масштабировано до {box}x{box}px."
+        else:
+            # FIT: вписываем с полями (сохраняем пропорции)
+            scale = box / max(w, h)
+            new = (max(1, round(w * scale)), max(1, round(h * scale)))
+            out = img.resize(new, Image.LANCZOS)
+            note = f"Масштаб до {out.width}x{out.height} (длинная сторона {box}px)."
+
+        # Шарпенинг для улучшения резкости
+        if sharpen:
+            out = out.filter(ImageFilter.SHARPEN)
 
     out.save(dst, format="WEBP", quality=95, method=6)
     size = dst.stat().st_size
@@ -220,7 +247,9 @@ async def _convert_video(src: Path, dst: Path, target: StickerTarget,
 
 
 async def _static_to_webm(src: Path, dst: Path, target: StickerTarget,
-                           max_side: int = STICKER_SIDE_DEFAULT) -> ConvertResult:
+                           max_side: int = STICKER_SIDE_DEFAULT,
+                           fit_mode: FitMode = FitMode.FIT,
+                           sharpen: bool = True) -> ConvertResult:
     box = _target_box(target, max_side)
     ffmpeg = config.ffmpeg_bin if config else "ffmpeg"
 
@@ -234,11 +263,24 @@ async def _static_to_webm(src: Path, dst: Path, target: StickerTarget,
         out_img = canvas
         dims_note = "100x100 (эмодзи)"
     else:
-        scale = box / max(w, h)
-        new = (max(1, round(w * scale)), max(1, round(h * scale)))
-        new = (new[0] - (new[0] % 2) or 2, new[1] - (new[1] % 2) or 2)
-        out_img = img.resize(new, Image.LANCZOS)
-        dims_note = f"{out_img.width}x{out_img.height}"
+        if fit_mode == FitMode.CROP:
+            size = min(w, h)
+            left = (w - size) // 2
+            top = (h - size) // 2
+            img = img.crop((left, top, left + size, top + size))
+            new = (box - (box % 2), box - (box % 2))  # чётные размеры
+            out_img = img.resize(new, Image.LANCZOS)
+            dims_note = f"{box}x{box}px (обрезка)"
+        else:
+            scale = box / max(w, h)
+            new = (max(1, round(w * scale)), max(1, round(h * scale)))
+            new = (new[0] - (new[0] % 2) or 2, new[1] - (new[1] % 2) or 2)
+            out_img = img.resize(new, Image.LANCZOS)
+            dims_note = f"{out_img.width}x{out_img.height}"
+
+        if sharpen:
+            out_img = out_img.filter(ImageFilter.SHARPEN)
+
     out_img.save(norm, format="PNG")
 
     duration = 1.0
@@ -272,8 +314,22 @@ async def _static_to_webm(src: Path, dst: Path, target: StickerTarget,
 async def process(src: Path, target: StickerTarget,
                   force_video: bool = False,
                   max_side: int = STICKER_SIDE_DEFAULT,
-                  speed_up: bool = False) -> ConvertResult:
-    if shutil.which((config.ffmpeg_bin if config else "ffmpeg")) is None:
+                  speed_up: bool = False,
+                  fit_mode: FitMode = FitMode.FIT,
+                  sharpen: bool = True) -> ConvertResult:
+    """Обработка медиафайла в стикер.
+    
+    Args:
+        src: Путь к исходному файлу
+        target: STICKER или EMOJI
+        force_video: Принудительно конвертировать в видео-стикер
+        max_side: Максимальный размер стороны (50-512)
+        speed_up: Ускорить видео вместо обрезки (для длинных видео)
+        fit_mode: FIT (с полями) или CROP (обрезка до квадрата)
+        sharpen: Применить шарпенинг
+    """
+    ffmpeg_path = config.ffmpeg_bin if config else "ffmpeg"
+    if shutil.which(ffmpeg_path) is None:
         raise MediaError("FFmpeg не найден. Установи: sudo apt install ffmpeg")
 
     info = await probe(src)
@@ -281,10 +337,11 @@ async def process(src: Path, target: StickerTarget,
 
     if info.kind == MediaKind.STATIC and not force_video:
         dst = TMP_DIR / f"{stem}_out.webp"
-        return await asyncio.to_thread(_convert_static, src, dst, target, max_side)
+        return await asyncio.to_thread(
+            _convert_static, src, dst, target, max_side, fit_mode, sharpen)
     elif info.kind == MediaKind.STATIC and force_video:
         dst = TMP_DIR / f"{stem}_out.webm"
-        return await _static_to_webm(src, dst, target, max_side)
+        return await _static_to_webm(src, dst, target, max_side, fit_mode, sharpen)
     else:
         dst = TMP_DIR / f"{stem}_out.webm"
         result = await _convert_video(src, dst, target, info, max_side, speed_up)

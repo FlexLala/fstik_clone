@@ -40,7 +40,17 @@ async def start_deeplink(message: Message, command: CommandObject,
         await message.answer("Ты владелец этого пака 🙂", reply_markup=main_menu())
         return
 
-    await db.add_member(pack["name"], user.id, user.username)
+    # Проверяем лимит участников
+    success = await db.add_member(pack["name"], user.id, user.username)
+    if not success:
+        limit = pack.get("max_members", 0)
+        await message.answer(
+            f"❌ Достигнут лимит участников ({limit}).\n"
+            "Попроси владельца увеличить лимит.",
+            reply_markup=main_menu(),
+        )
+        return
+
     await state.clear()
     await state.set_state(NewPack.waiting_media)
     await state.update_data(

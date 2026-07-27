@@ -253,8 +253,14 @@ async def receive_media(message: Message, state: FSMContext, bot: Bot):
 
     # Обычная конвертация
     async def _do():
-        return await process(src, target, force_video=force_video,
-                             max_side=max_side, fit_mode=fit_mode, sharpen=sharpen)
+        return await process(
+            src, target,
+            force_video=force_video,
+            max_side=max_side,
+            speed_up=False,
+            fit_mode=fit_mode,
+            sharpen=sharpen,
+        )
 
     try:
         result = await media_queue.run(_do)
@@ -303,9 +309,14 @@ async def speed_choice(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
     async def _do():
-        return await process(src, target, force_video=force_video,
-                             max_side=max_side, speed_up=speed_up,
-                             fit_mode=fit_mode, sharpen=sharpen)
+        return await process(
+            src, target,
+            force_video=force_video,
+            max_side=max_side,
+            speed_up=speed_up,
+            fit_mode=fit_mode,
+            sharpen=sharpen,
+        )
 
     try:
         result = await media_queue.run(_do)
@@ -395,6 +406,10 @@ async def confirm_add(call: CallbackQuery, state: FSMContext, bot: Bot):
     emoji = data.get("emoji") or ["⭐"]
     user = call.from_user
     user_id = user.id
+
+    # Если эмодзи не заданы, используем ⭐ по умолчанию
+    if not emoji:
+        emoji = ["⭐"]
 
     name = data.get("pack_name") or stickers.build_pack_name(
         title, user_id, config.bot_username)
