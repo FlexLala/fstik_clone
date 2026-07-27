@@ -171,7 +171,12 @@ def settings_kb(s: dict) -> InlineKeyboardMarkup:
     fit = s.get("fit_mode", "fit")
     sharp = s.get("sharpen", 1)
     kb.button(text=f"📐 Размер: {side}px", callback_data="settings:size")
-    fit_label = "✂️ Кроп (квадрат)" if fit == "crop" else "🖼 Вписать (с полями)"
+    if fit == "crop":
+        fit_label = "✂️ Кроп (квадрат)"
+    elif fit == "square":
+        fit_label = "📐 Квадрат (с прозрачными полями)"
+    else:
+        fit_label = "🖼 Вписать (с полями)"
     kb.button(text=f"Формат: {fit_label}", callback_data="settings:fit")
     sharp_label = "✅ Вкл" if sharp else "❌ Выкл"
     kb.button(text=f"🔍 Шарпенинг: {sharp_label}",

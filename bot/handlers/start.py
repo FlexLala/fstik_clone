@@ -145,10 +145,15 @@ async def reply_help(message: Message):
 @router.message(Command("settings"))
 async def reply_settings(message: Message):
     s = await get_user_settings(message.from_user.id)
+    fit_text = {
+        "fit": "Вписать (с полями)",
+        "crop": "Кроп (квадрат)",
+        "square": "Квадрат (с прозрачными полями)",
+    }.get(s["fit_mode"], "Вписать (с полями)")
     await message.answer(
         "⚙️ <b>Настройки обработки медиа</b>\n\n"
         f"📐 Размер: <b>{s['max_side']}px</b>\n"
-        f"🖼 Формат: <b>{'Кроп (квадрат)' if s['fit_mode'] == 'crop' else 'Вписать с полями'}</b>\n"
+        f"🖼 Формат: <b>{fit_text}</b>\n"
         f"🔍 Шарпенинг: <b>{'Вкл' if s['sharpen'] else 'Выкл'}</b>",
         reply_markup=settings_kb(s),
     )
@@ -158,11 +163,16 @@ async def reply_settings(message: Message):
 @router.callback_query(F.data == "settings:back")
 async def settings_back(call: CallbackQuery):
     s = await get_user_settings(call.from_user.id)
+    fit_text = {
+        "fit": "Вписать (с полями)",
+        "crop": "Кроп (квадрат)",
+        "square": "Квадрат (с прозрачными полями)",
+    }.get(s.get("fit_mode", "fit"), "Вписать (с полями)")
     try:
         await call.message.edit_text(
             "⚙️ <b>Настройки обработки медиа</b>\n\n"
             f"📐 Размер: <b>{s['max_side']}px</b>\n"
-            f"🖼 Формат: <b>{'Кроп (квадрат)' if s['fit_mode'] == 'crop' else 'Вписать с полями'}</b>\n"
+            f"🖼 Формат: <b>{fit_text}</b>\n"
             f"🔍 Шарпенинг: <b>{'Вкл' if s['sharpen'] else 'Выкл'}</b>",
             reply_markup=settings_kb(s),
         )
@@ -171,15 +181,21 @@ async def settings_back(call: CallbackQuery):
     await call.answer()
 
 
-# ─── формат (fit/crop) ────────────────────────────────────
+# ─── формат (fit/crop/square) ──────────────────────────────
 @router.callback_query(F.data == "settings:fit")
 async def toggle_fit(call: CallbackQuery):
     s = await get_user_settings(call.from_user.id)
-    new_fit = "crop" if s["fit_mode"] == "fit" else "fit"
+    current = s.get("fit_mode", "fit")
+    cycle = {"fit": "crop", "crop": "square", "square": "fit"}
+    new_fit = cycle.get(current, "fit")
     await set_user_settings(call.from_user.id, fit_mode=new_fit)
     s["fit_mode"] = new_fit
-    label = "✂️ Кроп (квадрат)" if new_fit == "crop" else "🖼 Вписать с полями"
-    await call.answer(f"Формат: {label}")
+    labels = {
+        "fit": "🖼 Вписать (с полями)",
+        "crop": "✂️ Кроп (квадрат)",
+        "square": "📐 Квадрат (с прозрачными полями)",
+    }
+    await call.answer(f"Формат: {labels[new_fit]}")
     try:
         await call.message.edit_reply_markup(reply_markup=settings_kb(s))
     except Exception:

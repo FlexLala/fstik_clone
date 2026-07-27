@@ -43,6 +43,7 @@ class FitMode(str, Enum):
     """Режим подгонки изображения."""
     FIT = "fit"      # Вписать с полями (сохранить пропорции)
     CROP = "crop"    # Обрезать до квадрата
+    SQUARE = "square"  # Квадратный с прозрачными полями (всегда box x box)
 
 
 @dataclass
@@ -150,6 +151,15 @@ def _convert_static(src: Path, dst: Path, target: StickerTarget,
             img = img.crop((left, top, left + size, top + size))
             out = img.resize((box, box), Image.LANCZOS)
             note = f"Обрезано и масштабировано до {box}x{box}px."
+        elif fit_mode == FitMode.SQUARE:
+            # Квадратный с прозрачными полями — всегда box x box
+            scale = box / max(w, h)
+            new = (max(1, round(w * scale)), max(1, round(h * scale)))
+            out = img.resize(new, Image.LANCZOS)
+            canvas = Image.new("RGBA", (box, box), (0, 0, 0, 0))
+            canvas.paste(out, ((box - out.width) // 2, (box - out.height) // 2), out)
+            out = canvas
+            note = f"Квадрат {box}x{box}px с прозрачными полями (масштаб до {new[0]}x{new[1]})."
         else:
             # FIT: вписываем с полями (сохраняем пропорции)
             scale = box / max(w, h)
@@ -271,6 +281,15 @@ async def _static_to_webm(src: Path, dst: Path, target: StickerTarget,
             new = (box - (box % 2), box - (box % 2))  # чётные размеры
             out_img = img.resize(new, Image.LANCZOS)
             dims_note = f"{box}x{box}px (обрезка)"
+        elif fit_mode == FitMode.SQUARE:
+            scale = box / max(w, h)
+            new = (max(1, round(w * scale)), max(1, round(h * scale)))
+            out_img = img.resize(new, Image.LANCZOS)
+            # Для квадратного режима делаем прозрачный квадрат
+            canvas = Image.new("RGBA", (box, box), (0, 0, 0, 0))
+            canvas.paste(out_img, ((box - out_img.width) // 2, (box - out_img.height) // 2), out_img)
+            out_img = canvas
+            dims_note = f"{box}x{box}px (квадрат с прозрачными полями)"
         else:
             scale = box / max(w, h)
             new = (max(1, round(w * scale)), max(1, round(h * scale)))
